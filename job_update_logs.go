@@ -8,7 +8,7 @@ import (
 	"time"
 
 	"github.com/bgentry/que-go"
-	"github.com/go-pg/pg"
+	"github.com/jackc/pgx"
 )
 
 const (
@@ -29,7 +29,7 @@ type CronMetadata struct {
 }
 
 type LogUpdater struct {
-	DB     *pg.DB
+	QC     *que.Client
 	URL    string
 	Logger *log.Logger
 }
@@ -38,37 +38,81 @@ const (
 	KeyUpdateLogs = "update_logs"
 )
 
-func singletonCron(db *pg.DB, logger *log.Logger, key string, jobID int64, f func(tx *pg.Tx) error) error {
-	return db.RunInTransaction(func(tx *pg.Tx) error {
-		logger.Println("starting", jobID)
-		defer logger.Println("stop", jobID)
-
-		cm := &CronMetadata{ID: key}
-		_, err := tx.Model(cm).For("UPDATE").SelectOrInsert()
-		if err != nil {
-			return err
-		}
-
-		logger.Println("got mutex", jobID)
-		if time.Now().Before(cm.NextScheduled) {
-			logger.Println("too early, come back later", jobID)
-			return nil
-		}
-
-		err = f(tx)
-		if err != nil {
-			return err
-		}
-
-		cm.LastCompleted = time.Now()
-		cm.NextScheduled = time.Now().Add(time.Hour * 24)
-
-		return tx.Update(cm)
+func enqueueCron(qc *que.Client, key string, when time.Time) error {
+	return qc.Enqueue(&que.Job{
+		Args:  []byte("{}"),
+		Type:  key,
+		RunAt: when,
 	})
 }
 
+func singletonCron(qc *que.Client, logger *log.Logger, key string, job *que.Job, f func(tx *pgx.Tx) error) error {
+	tx, err := job.Conn().Begin()
+	if err != nil {
+		return err
+	}
+
+	logger.Println("starting", job.ID)
+	defer logger.Println("stop", job.ID)
+
+	row := tx.QueryRow("SELECT last_completed, next_scheduled FROM cron_metadata WHERE id = $1 FOR UPDATE", key)
+	var lastCompleted time.Time
+	var nextScheduled time.Time
+	err = row.Scan(&lastCompleted, &nextScheduled)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	logger.Println("got mutex", job.ID)
+	if time.Now().Before(nextScheduled) {
+		if time.Now().Add(5 * time.Minute).After(nextScheduled) {
+			logger.Println("only slightly too early - clock skew perhaps (or coincidental server startup? We'll reschedule in a few mins", job.ID)
+			err = qc.EnqueueInTx(&que.Job{
+				Args:  []byte("{}"),
+				Type:  key,
+				RunAt: time.Now().Add(5 * time.Minute),
+			}, tx)
+			if err != nil {
+				return err
+			}
+			return tx.Commit()
+		}
+
+		// Don't re-enqueue ourselves - someone else can handle.
+		// TODO - can we selectively re-enqueue only if not other jobs exist?
+		tx.Rollback()
+		return nil
+	}
+
+	err = f(tx)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	n := time.Now()
+	next := n.Add(time.Hour * 24)
+
+	_, err = tx.Exec("UPDATE cron_metadata SET last_completed = $1, next_scheduled = $2 WHERE id = $3", n, next, key)
+	if err != nil {
+		tx.Rollback()
+		return err
+	}
+
+	err = qc.EnqueueInTx(&que.Job{
+		Args:  []byte("{}"),
+		Type:  key,
+		RunAt: next,
+	}, tx)
+	if err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 func (j *LogUpdater) Run(job *que.Job) error {
-	return singletonCron(j.DB, j.Logger, KeyUpdateLogs, job.ID, func(tx *pg.Tx) error {
+	return singletonCron(j.QC, j.Logger, KeyUpdateLogs, job, func(tx *pgx.Tx) error {
 		resp, err := http.Get(j.URL)
 		if err != nil {
 			return err
@@ -95,43 +139,34 @@ func (j *LogUpdater) Run(job *que.Job) error {
 		}
 
 		for _, l := range logData.Logs {
-			ml := &MonitoredLog{
-				URL: l.URL,
-			}
 			dirty := false
-			exists := false
-			err := tx.Select(ml)
-			if err == nil {
-				exists = true
-			} else {
-				if isErrNotFound(err) {
-					// that's fine, we will create and save.
+
+			var dbProcessed int64
+			var dbState int
+
+			err := tx.QueryRow("SELECT processed, state FROM monitored_logs WHERE url = $1", l.URL).Scan(&dbProcessed, &dbState)
+			if err != nil {
+				if err == pgx.ErrNoRows {
 					dirty = true
 				} else {
-					j.Logger.Println("ERROR reading monitored log, skipping: ", err)
-					continue
+					return err
 				}
 			}
 
-			if (l.FinalSTH != nil || l.DisqualifiedAt != 0) && ml.State == StateActive {
-				ml.State = StateIgnore
+			if (l.FinalSTH != nil || l.DisqualifiedAt != 0) && dbState == StateActive {
 				dirty = true
+				dbState = StateIgnore
 			}
 
 			if dirty {
-				if exists {
-					err = tx.Update(ml)
-				} else {
-					err = tx.Insert(ml)
-				}
+				_, err = tx.Exec("INSERT INTO monitored_logs (url, state, processed) VALUES ($1, $2, $3) ON CONFLICT (url) DO UPDATE SET state = $4", l.URL, dbState, dbProcessed, dbState)
 				if err != nil {
-					j.Logger.Println("ERROR updating log for: ", ml.URL)
-					continue
+					j.Logger.Println("ERROR updating log for: ", l.URL, err)
+					return err
 				}
-
-				j.Logger.Println("Updated metadata for ", ml.URL)
+				j.Logger.Println("Updated metadata for ", l.URL)
 			} else {
-				j.Logger.Println("No changes in metadata for ", ml.URL)
+				j.Logger.Println("No changes in metadata for ", l.URL)
 			}
 		}
 

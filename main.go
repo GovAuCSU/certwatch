@@ -2,7 +2,6 @@ package main
 
 import (
 	"errors"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
@@ -11,7 +10,6 @@ import (
 	"time"
 
 	cfenv "github.com/cloudfoundry-community/go-cfenv"
-	"github.com/go-pg/pg"
 	"github.com/gorilla/websocket"
 
 	"github.com/bgentry/que-go"
@@ -99,7 +97,6 @@ type CertObserved struct {
 }
 
 type server struct {
-	DB *pg.DB
 }
 
 // Return a database object, using the CloudFoundry environment data
@@ -131,20 +128,20 @@ func (s *server) gotCert(cert *Certificate) error {
 	}
 
 	if interesting {
-		for _, dom := range cert.AllDomains {
-			err := s.DB.Insert(&CertObserved{
-				Domain:       dom,
-				SerialNumber: cert.SerialNumber,
-				Seen:         time.Now(),
-			})
-			if err != nil {
-				// we will often run two of us, to ensure we don't miss anything, so we expect a lot of duplicate errors
-				if isErrDuplicateKey(err) {
-					continue
-				}
-				return err
-			}
-		}
+		// for _, dom := range cert.AllDomains {
+		// 	err := s.DB.Insert(&CertObserved{
+		// 		Domain:       dom,
+		// 		SerialNumber: cert.SerialNumber,
+		// 		Seen:         time.Now(),
+		// 	})
+		// 	if err != nil {
+		// 		// we will often run two of us, to ensure we don't miss anything, so we expect a lot of duplicate errors
+		// 		if isErrDuplicateKey(err) {
+		// 			continue
+		// 		}
+		// 		return err
+		// 	}
+		// }
 	}
 
 	return nil
@@ -184,8 +181,8 @@ func initQueStructures(creds map[string]interface{}) error {
 		return err
 	}
 
-	_, err = pgxPool.Exec(`CREATE TABLE IF NOT EXISTS que_jobs
-		(
+	_, err = pgxPool.Exec(`
+		CREATE TABLE IF NOT EXISTS que_jobs (
 		  priority    smallint    NOT NULL DEFAULT 100,
 		  run_at      timestamptz NOT NULL DEFAULT now(),
 		  job_id      bigserial   NOT NULL,
@@ -198,39 +195,24 @@ func initQueStructures(creds map[string]interface{}) error {
 		  CONSTRAINT que_jobs_pkey PRIMARY KEY (queue, priority, run_at, job_id)
 		);
  
-		COMMENT ON TABLE que_jobs IS '3';`)
+		COMMENT ON TABLE que_jobs IS '3';
+		
+		CREATE TABLE IF NOT EXISTS cron_metadata (
+			id             text                     PRIMARY KEY,
+			last_completed timestamp with time zone NOT NULL DEFAULT TIMESTAMP 'EPOCH',
+			next_scheduled timestamp with time zone NOT NULL DEFAULT TIMESTAMP 'EPOCH'
+		);
+		INSERT INTO cron_metadata(id) VALUES('update_logs') ON CONFLICT DO NOTHING;
+				
+		CREATE TABLE IF NOT EXISTS monitored_logs (
+			url       text      PRIMARY KEY,
+			processed bigint    NOT NULL,
+			state     integer   NOT NULL
+		);		
+	`)
 	if err != nil {
 		return err
 	}
-
-	return nil
-}
-
-func initORMTables(db *pg.DB) error {
-	for _, model := range []interface{}{
-		&CertObserved{},
-		&MonitoredLog{},
-		&CronMetadata{},
-	} {
-		err := db.CreateTable(model, nil)
-		if err != nil {
-			// swallow this one, we'll see if on every startup
-			if isErrRelationAlreadyExists(err) {
-				continue
-			}
-			return err
-		}
-	}
-
-	// Create dummy records if needed, so that we can lock on them
-	// err := db.Insert(&CronMetadata{
-	// 	ID: KeyUpdateLogs,
-	// })
-	// if err != nil {
-	// 	if !isErrDuplicateKey(err) {
-	// 		return err
-	// 	}
-	// }
 
 	return nil
 }
@@ -242,18 +224,6 @@ func main() {
 	}
 
 	err = initQueStructures(creds)
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	pg := pg.Connect(&pg.Options{
-		Addr:     fmt.Sprintf("%s:%d", creds["host"].(string), int(creds["port"].(float64))),
-		Database: creds["name"].(string),
-		User:     creds["username"].(string),
-		Password: creds["password"].(string),
-	})
-
-	err = initORMTables(pg)
 	if err != nil {
 		log.Fatal(err)
 	}
@@ -275,18 +245,16 @@ func main() {
 	qc := que.NewClient(pgxPool)
 	workers := que.NewWorkerPool(qc, que.WorkMap{
 		KeyUpdateLogs: (&LogUpdater{
-			DB:     pg,
-			Logger: log.New(os.Stderr, "LOGUPDATER", log.LstdFlags),
+			QC:     qc,
+			Logger: log.New(os.Stderr, "LOGUPDATER ", log.LstdFlags),
 			URL:    KnownLogsURL,
 		}).Run,
 	}, WorkerCount)
 
 	// Prepare a shutdown function
 	shutdown := func() {
-		defer pg.Close()
-		defer pgxPool.Close()
-
 		workers.Shutdown()
+		pgxPool.Close()
 	}
 
 	// Normal exit
@@ -306,14 +274,29 @@ func main() {
 
 	go workers.Start()
 
-	for i := 0; i < 3; i++ {
-		err = qc.Enqueue(&que.Job{
-			Args: []byte("{}"),
-			Type: KeyUpdateLogs,
-		})
-		if err != nil {
-			log.Fatal(err)
-		}
+	err = enqueueCron(qc, KeyUpdateLogs, time.Now())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	err = enqueueCron(qc, KeyUpdateLogs, time.Now())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	err = enqueueCron(qc, KeyUpdateLogs, time.Now())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	err = enqueueCron(qc, KeyUpdateLogs, time.Now())
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	err = enqueueCron(qc, KeyUpdateLogs, time.Now())
+	if err != nil {
+		log.Fatal(err)
 	}
 
 	log.Println("Started up... waiting for ctrl-C.")
