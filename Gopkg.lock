@@ -2,6 +2,12 @@
 
 
 [[projects]]
+  name = "github.com/bgentry/que-go"
+  packages = ["."]
+  revision = "04623be4201ec7abb8d6cd0f172a4c612e216cc4"
+  version = "v1.0.1"
+
+[[projects]]
   name = "github.com/cloudfoundry-community/go-cfenv"
   packages = ["."]
   revision = "f920e9562d5f951cbf11785728f67258c38a10d0"
@@ -27,6 +33,19 @@
   version = "v1.2.0"
 
 [[projects]]
+  name = "github.com/jackc/pgx"
+  packages = [
+    ".",
+    "chunkreader",
+    "internal/sanitize",
+    "pgio",
+    "pgproto3",
+    "pgtype"
+  ]
+  revision = "da3231b0b66e2e74cdb779f1d46c5e958ba8be27"
+  version = "v3.1.0"
+
+[[projects]]
   branch = "master"
   name = "github.com/jinzhu/inflection"
   packages = ["."]
@@ -38,9 +57,15 @@
   packages = ["."]
   revision = "a4e142e9c047c904fa2f1e144d9a84e6133024bc"
 
+[[projects]]
+  name = "github.com/pkg/errors"
+  packages = ["."]
+  revision = "645ef00459ed84a119197bfb8d8205042c6df63d"
+  version = "v0.8.0"
+
 [solve-meta]
   analyzer-name = "dep"
   analyzer-version = 1
-  inputs-digest = "bf96a013a316dd950d6f441c56b1e9d517ad69f06bde85e9c1b69eaf45ba50dc"
+  inputs-digest = "a1d24344fe0fbb7c898094ed4df59ea19ca4b93a0829fb591428b58acc487875"
   solver-name = "gps-cdcl"
   solver-version = 1
