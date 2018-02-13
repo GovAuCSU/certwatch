@@ -4,12 +4,18 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"os"
+	"os/signal"
 	"strings"
+	"syscall"
 	"time"
 
 	cfenv "github.com/cloudfoundry-community/go-cfenv"
 	"github.com/go-pg/pg"
 	"github.com/gorilla/websocket"
+
+	"github.com/bgentry/que-go"
+	"github.com/jackc/pgx"
 )
 
 type Certificate struct {
@@ -97,7 +103,7 @@ type server struct {
 }
 
 // Return a database object, using the CloudFoundry environment data
-func postgresDBFromCF() (*pg.DB, error) {
+func postgresCredsFromCF() (map[string]interface{}, error) {
 	appEnv, err := cfenv.Current()
 	if err != nil {
 		return nil, err
@@ -112,12 +118,7 @@ func postgresDBFromCF() (*pg.DB, error) {
 		return nil, errors.New("expecting 1 database")
 	}
 
-	return pg.Connect(&pg.Options{
-		Addr:     fmt.Sprintf("%s:%d", dbEnv[0].Credentials["host"].(string), int(dbEnv[0].Credentials["port"].(float64))),
-		Database: dbEnv[0].Credentials["name"].(string),
-		User:     dbEnv[0].Credentials["username"].(string),
-		Password: dbEnv[0].Credentials["password"].(string),
-	}), nil
+	return dbEnv[0].Credentials, nil
 }
 
 func (s *server) gotCert(cert *Certificate) error {
@@ -157,11 +158,61 @@ func isErrDuplicateKey(err error) bool {
 	return err != nil && strings.HasPrefix(err.Error(), "ERROR #23505")
 }
 
-func (s *server) Init() error {
+func isErrNotFound(err error) bool {
+	return err != nil && err.Error() == "pg: no rows in result set"
+}
+
+const (
+	KnownLogsURL = "https://www.gstatic.com/ct/log_list/log_list.json"
+	WorkerCount  = 10
+
+	MutexJobUpdate = 100
+)
+
+func initQueStructures(creds map[string]interface{}) error {
+	pgxPool, err := pgx.NewConnPool(pgx.ConnPoolConfig{
+		ConnConfig: pgx.ConnConfig{
+			Database: creds["name"].(string),
+			User:     creds["username"].(string),
+			Password: creds["password"].(string),
+			Host:     creds["host"].(string),
+			Port:     uint16(creds["port"].(float64)),
+		},
+	})
+	defer pgxPool.Close()
+	if err != nil {
+		return err
+	}
+
+	_, err = pgxPool.Exec(`CREATE TABLE IF NOT EXISTS que_jobs
+		(
+		  priority    smallint    NOT NULL DEFAULT 100,
+		  run_at      timestamptz NOT NULL DEFAULT now(),
+		  job_id      bigserial   NOT NULL,
+		  job_class   text        NOT NULL,
+		  args        json        NOT NULL DEFAULT '[]'::json,
+		  error_count integer     NOT NULL DEFAULT 0,
+		  last_error  text,
+		  queue       text        NOT NULL DEFAULT '',
+ 
+		  CONSTRAINT que_jobs_pkey PRIMARY KEY (queue, priority, run_at, job_id)
+		);
+ 
+		COMMENT ON TABLE que_jobs IS '3';`)
+	if err != nil {
+		return err
+	}
+
+	return nil
+}
+
+func initORMTables(db *pg.DB) error {
 	for _, model := range []interface{}{
 		&CertObserved{},
+		&MonitoredLog{},
+		&CronMetadata{},
 	} {
-		err := s.DB.CreateTable(model, nil)
+		err := db.CreateTable(model, nil)
 		if err != nil {
 			// swallow this one, we'll see if on every startup
 			if isErrRelationAlreadyExists(err) {
@@ -170,22 +221,112 @@ func (s *server) Init() error {
 			return err
 		}
 	}
+
+	// Create dummy records if needed, so that we can lock on them
+	// err := db.Insert(&CronMetadata{
+	// 	ID: KeyUpdateLogs,
+	// })
+	// if err != nil {
+	// 	if !isErrDuplicateKey(err) {
+	// 		return err
+	// 	}
+	// }
+
 	return nil
 }
 
 func main() {
-	db, err := postgresDBFromCF()
+	creds, err := postgresCredsFromCF()
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	s := &server{
-		DB: db,
-	}
-	err = s.Init()
+	err = initQueStructures(creds)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	s.StreamAndLog()
+	pg := pg.Connect(&pg.Options{
+		Addr:     fmt.Sprintf("%s:%d", creds["host"].(string), int(creds["port"].(float64))),
+		Database: creds["name"].(string),
+		User:     creds["username"].(string),
+		Password: creds["password"].(string),
+	})
+
+	err = initORMTables(pg)
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	pgxPool, err := pgx.NewConnPool(pgx.ConnPoolConfig{
+		ConnConfig: pgx.ConnConfig{
+			Database: creds["name"].(string),
+			User:     creds["username"].(string),
+			Password: creds["password"].(string),
+			Host:     creds["host"].(string),
+			Port:     uint16(creds["port"].(float64)),
+		},
+		AfterConnect: que.PrepareStatements,
+	})
+	if err != nil {
+		log.Fatal(err)
+	}
+
+	qc := que.NewClient(pgxPool)
+	workers := que.NewWorkerPool(qc, que.WorkMap{
+		KeyUpdateLogs: (&LogUpdater{
+			DB:     pg,
+			Logger: log.New(os.Stderr, "LOGUPDATER", log.LstdFlags),
+			URL:    KnownLogsURL,
+		}).Run,
+	}, WorkerCount)
+
+	// Prepare a shutdown function
+	shutdown := func() {
+		defer pg.Close()
+		defer pgxPool.Close()
+
+		workers.Shutdown()
+	}
+
+	// Normal exit
+	defer shutdown()
+
+	// Or via signals
+	sigCh := make(chan os.Signal, 1)
+	signal.Notify(sigCh, os.Interrupt)
+	signal.Notify(sigCh, syscall.SIGTERM)
+	go func() {
+		sig := <-sigCh
+		log.Printf("Received %v, starting shutdown...", sig)
+		shutdown()
+		log.Println("Shutdown complete")
+		os.Exit(0)
+	}()
+
+	go workers.Start()
+
+	for i := 0; i < 3; i++ {
+		err = qc.Enqueue(&que.Job{
+			Args: []byte("{}"),
+			Type: KeyUpdateLogs,
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+	}
+
+	log.Println("Started up... waiting for ctrl-C.")
+	select {}
+
+	// s := &server{
+	// 	DB: db,
+	// }
+	// err = s.Init()
+	// if err != nil {
+	// 	log.Fatal(err)
+	// }
+
+	// s.updateLogs(KnownLogsURL)
+	// //s.StreamAndLog()
 }
