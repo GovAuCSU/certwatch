@@ -167,57 +167,6 @@ const (
 	MutexJobUpdate = 100
 )
 
-func initQueStructures(creds map[string]interface{}) error {
-	pgxPool, err := pgx.NewConnPool(pgx.ConnPoolConfig{
-		ConnConfig: pgx.ConnConfig{
-			Database: creds["name"].(string),
-			User:     creds["username"].(string),
-			Password: creds["password"].(string),
-			Host:     creds["host"].(string),
-			Port:     uint16(creds["port"].(float64)),
-		},
-	})
-	defer pgxPool.Close()
-	if err != nil {
-		return err
-	}
-
-	_, err = pgxPool.Exec(`
-		CREATE TABLE IF NOT EXISTS que_jobs (
-		  priority    smallint    NOT NULL DEFAULT 100,
-		  run_at      timestamptz NOT NULL DEFAULT now(),
-		  job_id      bigserial   NOT NULL,
-		  job_class   text        NOT NULL,
-		  args        json        NOT NULL DEFAULT '[]'::json,
-		  error_count integer     NOT NULL DEFAULT 0,
-		  last_error  text,
-		  queue       text        NOT NULL DEFAULT '',
- 
-		  CONSTRAINT que_jobs_pkey PRIMARY KEY (queue, priority, run_at, job_id)
-		);
- 
-		COMMENT ON TABLE que_jobs IS '3';
-		
-		CREATE TABLE IF NOT EXISTS cron_metadata (
-			id             text                     PRIMARY KEY,
-			last_completed timestamp with time zone NOT NULL DEFAULT TIMESTAMP 'EPOCH',
-			next_scheduled timestamp with time zone NOT NULL DEFAULT TIMESTAMP 'EPOCH'
-		);
-		INSERT INTO cron_metadata(id) VALUES('update_logs') ON CONFLICT DO NOTHING;
-				
-		CREATE TABLE IF NOT EXISTS monitored_logs (
-			url       text      PRIMARY KEY,
-			processed bigint    NOT NULL,
-			state     integer   NOT NULL
-		);		
-	`)
-	if err != nil {
-		return err
-	}
-
-	return nil
-}
-
 type DBInitter struct {
 	InitSQL            string
 	PreparedStatements map[string]string
@@ -278,11 +227,6 @@ func main() {
 		log.Fatal(err)
 	}
 
-	err = initQueStructures(creds)
-	if err != nil {
-		log.Fatal(err)
-	}
-
 	pgxPool, err := pgx.NewConnPool(pgx.ConnPoolConfig{
 		ConnConfig: pgx.ConnConfig{
 			Database: creds["name"].(string),
@@ -313,12 +257,11 @@ func main() {
 					last_completed timestamp with time zone NOT NULL DEFAULT TIMESTAMP 'EPOCH',
 					next_scheduled timestamp with time zone NOT NULL DEFAULT TIMESTAMP 'EPOCH'
 				);
-				INSERT INTO cron_metadata(id) VALUES('update_logs') ON CONFLICT DO NOTHING;
 
 				CREATE TABLE IF NOT EXISTS monitored_logs (
 					url       text      PRIMARY KEY,
-					processed bigint    NOT NULL,
-					state     integer   NOT NULL
+					processed bigint    NOT NULL DEFAULT 0,
+					state     integer   NOT NULL DEFAULT 0
 				);`,
 			OtherStatements:    que.PrepareStatements,
 			PreparedStatements: map[string]string{},
@@ -334,6 +277,10 @@ func main() {
 			QC:     qc,
 			Logger: log.New(os.Stderr, "LOGUPDATER ", log.LstdFlags),
 			URL:    KnownLogsURL,
+		}).Run,
+		KeyNewLogMetadata: (&NewLogMetadata{
+			QC:     qc,
+			Logger: log.New(os.Stderr, "LOGMETADATA ", log.LstdFlags),
 		}).Run,
 	}, WorkerCount)
 
@@ -360,42 +307,15 @@ func main() {
 
 	go workers.Start()
 
-	err = enqueueCron(qc, KeyUpdateLogs, time.Now())
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = enqueueCron(qc, KeyUpdateLogs, time.Now())
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = enqueueCron(qc, KeyUpdateLogs, time.Now())
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = enqueueCron(qc, KeyUpdateLogs, time.Now())
-	if err != nil {
-		log.Fatal(err)
-	}
-
-	err = enqueueCron(qc, KeyUpdateLogs, time.Now())
+	err = qc.Enqueue(&que.Job{
+		Type:  KeyUpdateLogs,
+		Args:  []byte("{}"),
+		RunAt: time.Now(),
+	})
 	if err != nil {
 		log.Fatal(err)
 	}
 
 	log.Println("Started up... waiting for ctrl-C.")
 	select {}
-
-	// s := &server{
-	// 	DB: db,
-	// }
-	// err = s.Init()
-	// if err != nil {
-	// 	log.Fatal(err)
-	// }
-
-	// s.updateLogs(KnownLogsURL)
-	// //s.StreamAndLog()
 }
