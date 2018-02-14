@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 
@@ -217,6 +218,60 @@ func initQueStructures(creds map[string]interface{}) error {
 	return nil
 }
 
+type DBInitter struct {
+	InitSQL            string
+	PreparedStatements map[string]string
+	OtherStatements    func(*pgx.Conn) error
+
+	// Clearly this won't stop other instances in a race condition, but should at least stop ourselves from hammering ourselves unnecessarily
+	runMutex   sync.Mutex
+	runAlready bool
+}
+
+func (dbi *DBInitter) ensureInitDone(c *pgx.Conn) error {
+	dbi.runMutex.Lock()
+	defer dbi.runMutex.Unlock()
+
+	if dbi.runAlready {
+		return nil
+	}
+
+	_, err := c.Exec(dbi.InitSQL)
+	if err != nil {
+		return err
+	}
+
+	dbi.runAlready = true
+	return nil
+}
+
+func (dbi *DBInitter) AfterConnect(c *pgx.Conn) error {
+	if dbi.InitSQL != "" {
+		err := dbi.ensureInitDone(c)
+		if err != nil {
+			return err
+		}
+	}
+
+	if dbi.OtherStatements != nil {
+		err := dbi.OtherStatements(c)
+		if err != nil {
+			return err
+		}
+	}
+
+	if dbi.PreparedStatements != nil {
+		for n, sql := range dbi.PreparedStatements {
+			_, err := c.Prepare(n, sql)
+			if err != nil {
+				return err
+			}
+		}
+	}
+
+	return nil
+}
+
 func main() {
 	creds, err := postgresCredsFromCF()
 	if err != nil {
@@ -236,7 +291,38 @@ func main() {
 			Host:     creds["host"].(string),
 			Port:     uint16(creds["port"].(float64)),
 		},
-		AfterConnect: que.PrepareStatements,
+		AfterConnect: (&DBInitter{
+			InitSQL: `
+				CREATE TABLE IF NOT EXISTS que_jobs (
+					priority    smallint    NOT NULL DEFAULT 100,
+					run_at      timestamptz NOT NULL DEFAULT now(),
+					job_id      bigserial   NOT NULL,
+					job_class   text        NOT NULL,
+					args        json        NOT NULL DEFAULT '[]'::json,
+					error_count integer     NOT NULL DEFAULT 0,
+					last_error  text,
+					queue       text        NOT NULL DEFAULT '',
+
+					CONSTRAINT que_jobs_pkey PRIMARY KEY (queue, priority, run_at, job_id)
+				);
+
+				COMMENT ON TABLE que_jobs IS '3';
+
+				CREATE TABLE IF NOT EXISTS cron_metadata (
+					id             text                     PRIMARY KEY,
+					last_completed timestamp with time zone NOT NULL DEFAULT TIMESTAMP 'EPOCH',
+					next_scheduled timestamp with time zone NOT NULL DEFAULT TIMESTAMP 'EPOCH'
+				);
+				INSERT INTO cron_metadata(id) VALUES('update_logs') ON CONFLICT DO NOTHING;
+
+				CREATE TABLE IF NOT EXISTS monitored_logs (
+					url       text      PRIMARY KEY,
+					processed bigint    NOT NULL,
+					state     integer   NOT NULL
+				);`,
+			OtherStatements:    que.PrepareStatements,
+			PreparedStatements: map[string]string{},
+		}).AfterConnect,
 	})
 	if err != nil {
 		log.Fatal(err)

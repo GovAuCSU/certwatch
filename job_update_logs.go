@@ -66,23 +66,29 @@ func singletonCron(qc *que.Client, logger *log.Logger, key string, job *que.Job,
 
 	logger.Println("got mutex", job.ID)
 	if time.Now().Before(nextScheduled) {
-		if time.Now().Add(5 * time.Minute).After(nextScheduled) {
-			logger.Println("only slightly too early - clock skew perhaps (or coincidental server startup? We'll reschedule in a few mins", job.ID)
-			err = qc.EnqueueInTx(&que.Job{
-				Args:  []byte("{}"),
-				Type:  key,
-				RunAt: time.Now().Add(5 * time.Minute),
-			}, tx)
-			if err != nil {
-				return err
-			}
-			return tx.Commit()
+		var futureJobs int
+		err = tx.QueryRow("SELECT count(*) FROM que_jobs WHERE job_class = $1 AND run_at >= $2", key, nextScheduled).Scan(&futureJobs)
+		if err != nil {
+			panic(err)
+			return err
 		}
 
-		// Don't re-enqueue ourselves - someone else can handle.
-		// TODO - can we selectively re-enqueue only if not other jobs exist?
-		tx.Rollback()
-		return nil
+		if futureJobs > 0 {
+			logger.Println("Enough future jobs already scheduled.", job.ID)
+			tx.Rollback()
+			return nil
+		}
+
+		logger.Println("No future jobs found, scheduling one to match end time", job.ID)
+		err = qc.EnqueueInTx(&que.Job{
+			Args:  []byte("{}"),
+			Type:  key,
+			RunAt: nextScheduled,
+		}, tx)
+		if err != nil {
+			return err
+		}
+		return tx.Commit()
 	}
 
 	err = f(tx)
