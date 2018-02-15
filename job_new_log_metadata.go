@@ -8,26 +8,16 @@ import (
 	"github.com/jackc/pgx"
 )
 
-type NewLogMetadata struct {
-	QC     *que.Client
-	Logger *log.Logger
-}
+const (
+	KeyNewLogMetadata = "new_log_metadata"
+)
 
-func (j *NewLogMetadata) Run(job *que.Job) error {
-	j.Logger.Println("start")
-	defer j.Logger.Println("stop")
-
+func NewLogMetadata(qc *que.Client, logger *log.Logger, job *que.Job, tx *pgx.Tx) error {
 	var l CTLog
 	err := json.Unmarshal(job.Args, &l)
 	if err != nil {
 		return err
 	}
-
-	tx, err := job.Conn().Begin()
-	if err != nil {
-		return err
-	}
-	defer tx.Rollback()
 
 	var dbState int
 	err = tx.QueryRow("SELECT state FROM monitored_logs WHERE url = $1 FOR UPDATE", l.URL).Scan(&dbState)
@@ -51,10 +41,18 @@ func (j *NewLogMetadata) Run(job *que.Job) error {
 		if err != nil {
 			return err
 		}
-		err = tx.Commit()
-		if err != nil {
-			return err
-		}
+	}
+
+	bb, err := json.Marshal(&CheckSTHConf{URL: l.URL})
+	if err != nil {
+		return err
+	}
+	err = qc.EnqueueInTx(&que.Job{
+		Type: KeyCheckSTH,
+		Args: bb,
+	}, tx)
+	if err != nil {
+		return err
 	}
 
 	return nil

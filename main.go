@@ -161,10 +161,7 @@ func isErrNotFound(err error) bool {
 }
 
 const (
-	KnownLogsURL = "https://www.gstatic.com/ct/log_list/log_list.json"
-	WorkerCount  = 10
-
-	MutexJobUpdate = 100
+	WorkerCount = 10
 )
 
 type DBInitter struct {
@@ -273,14 +270,24 @@ func main() {
 
 	qc := que.NewClient(pgxPool)
 	workers := que.NewWorkerPool(qc, que.WorkMap{
-		KeyUpdateLogs: (&LogUpdater{
-			QC:     qc,
-			Logger: log.New(os.Stderr, "LOGUPDATER ", log.LstdFlags),
-			URL:    KnownLogsURL,
+		KeyUpdateLogs: (&JobFuncWrapper{
+			QC:        qc,
+			Logger:    log.New(os.Stderr, KeyUpdateLogs+" ", log.LstdFlags),
+			F:         UpdateCTLogList,
+			Singleton: true,
+			Duration:  time.Hour * 24,
 		}).Run,
-		KeyNewLogMetadata: (&NewLogMetadata{
+		KeyNewLogMetadata: (&JobFuncWrapper{
 			QC:     qc,
-			Logger: log.New(os.Stderr, "LOGMETADATA ", log.LstdFlags),
+			Logger: log.New(os.Stderr, KeyNewLogMetadata+" ", log.LstdFlags),
+			F:      NewLogMetadata,
+		}).Run,
+		KeyCheckSTH: (&JobFuncWrapper{
+			QC:        qc,
+			Logger:    log.New(os.Stderr, KeyCheckSTH+" ", log.LstdFlags),
+			F:         CheckLogSTH,
+			Singleton: true,
+			Duration:  time.Minute * 5,
 		}).Run,
 	}, WorkerCount)
 
