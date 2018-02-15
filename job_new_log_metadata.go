@@ -41,18 +41,21 @@ func NewLogMetadata(qc *que.Client, logger *log.Logger, job *que.Job, tx *pgx.Tx
 		if err != nil {
 			return err
 		}
+		dbState = StateIgnore
 	}
 
-	bb, err := json.Marshal(&CheckSTHConf{URL: l.URL})
-	if err != nil {
-		return err
-	}
-	err = qc.EnqueueInTx(&que.Job{
-		Type: KeyCheckSTH,
-		Args: bb,
-	}, tx)
-	if err != nil {
-		return err
+	if dbState == StateActive {
+		bb, err := json.Marshal(&CheckSTHConf{URL: l.URL})
+		if err != nil {
+			return err
+		}
+		err = qc.EnqueueInTx(&que.Job{
+			Type: KeyCheckSTH,
+			Args: bb,
+		}, tx)
+		if err != nil {
+			return err
+		}
 	}
 
 	return nil

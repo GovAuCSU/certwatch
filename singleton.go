@@ -10,7 +10,8 @@ import (
 )
 
 var (
-	ErrTryAgainPlease = errors.New("try again, now we have metadata")
+	ErrTryAgainPlease  = errors.New("try again, now we have metadata")
+	ErrDoNotReschedule = errors.New("no need to reschedule, we are done")
 )
 
 type JobFunc func(qc *que.Client, logger *log.Logger, job *que.Job, tx *pgx.Tx) error
@@ -120,6 +121,10 @@ func (scw *JobFuncWrapper) Run(job *que.Job) error {
 
 	err = scw.F(scw.QC, scw.Logger, job, tx)
 	if err != nil {
+		if err == ErrDoNotReschedule {
+			scw.Logger.Println("job has requested to NOT be rescheduled", job.ID)
+			return nil
+		}
 		return err
 	}
 

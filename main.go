@@ -289,6 +289,11 @@ func main() {
 			Singleton: true,
 			Duration:  time.Minute * 5,
 		}).Run,
+		KeyGetEntries: (&JobFuncWrapper{
+			QC:     qc,
+			Logger: log.New(os.Stderr, KeyGetEntries+" ", log.LstdFlags),
+			F:      GetEntries,
+		}).Run,
 	}, WorkerCount)
 
 	// Prepare a shutdown function
