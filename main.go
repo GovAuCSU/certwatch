@@ -11,91 +11,10 @@ import (
 	"time"
 
 	cfenv "github.com/cloudfoundry-community/go-cfenv"
-	"github.com/gorilla/websocket"
 
 	"github.com/bgentry/que-go"
 	"github.com/jackc/pgx"
 )
-
-type Certificate struct {
-	Subject struct {
-		Aggregated       string `json:"aggregated"`
-		Country          string `json:"C"`
-		State            string `json:"ST"`
-		Locality         string `json:"L"`
-		Organisation     string `json:"O"`
-		OrganisationUnit string `json:"OU"`
-		CommonName       string `json:"CN"`
-	} `json:"subject"`
-	Extensions struct {
-		KeyUsage               string `json:"keyUsage"`
-		ExtendedKeyUsage       string `json:"extendedKeyUsage"`
-		BasicConstraints       string `json:"basicConstraints"`
-		SubjectKeyIdentifier   string `json:"subjectKeyIdentifier"`
-		AuthorityKeyIdentifier string `json:"authorityKeyIdentifier"`
-		AuthorityInfoAccess    string `json:"authorityInfoAccess"`
-		SubjectAltName         string `json:"subjectAltName"`
-		CertificatePolicies    string `json:"certificatePolicies"`
-		CRLDistributionPoints  string `json:"crlDistributionPoints"`
-	} `json:"extensions"`
-	NotBefore    float64  `json:"not_before"`
-	NotAfter     float64  `json:"not_after"`
-	SerialNumber string   `json:"serial_number"`
-	Fingerprint  string   `json:"fingerprint"`
-	DER          string   `json:"as_der"`
-	AllDomains   []string `json:"all_domains"`
-}
-
-type Message struct {
-	MessageType string `json:"message_type"`
-	Data        struct {
-		UpdateType string        `json:"update_type"`
-		LeafCert   Certificate   `json:"leaf_cert"`
-		Chain      []Certificate `json:"chain"`
-	} `json:data`
-	CertIndex int64   `json:"cert_index"`
-	Seen      float64 `json:"seen"`
-	Source    struct {
-		URL  string `json:"url"`
-		Name string `json:"name"`
-	} `json:"source"`
-}
-
-func (s *server) StreamAndLog() {
-	for {
-		c, _, err := websocket.DefaultDialer.Dial("wss://certstream.calidog.io", nil)
-
-		if err != nil {
-			log.Println("Error connecting to certstream! Sleeping a few seconds and reconnecting... ")
-			time.Sleep(5 * time.Second)
-			continue
-		}
-
-		for {
-			var message Message
-			err := c.ReadJSON(&message)
-			if err != nil {
-				log.Println("Error reading message")
-				break
-			}
-
-			if message.MessageType == "certificate_update" {
-				err = s.gotCert(&message.Data.LeafCert)
-				if err != nil {
-					log.Println("error having cert", err)
-				}
-			}
-		}
-
-		c.Close()
-	}
-}
-
-type CertObserved struct {
-	Domain       string `sql:",pk"`
-	SerialNumber string `sql:",pk"`
-	Seen         time.Time
-}
 
 type server struct {
 }
@@ -117,35 +36,6 @@ func postgresCredsFromCF() (map[string]interface{}, error) {
 	}
 
 	return dbEnv[0].Credentials, nil
-}
-
-func (s *server) gotCert(cert *Certificate) error {
-	interesting := false
-	for _, dom := range cert.AllDomains {
-		if strings.HasSuffix(dom, ".com") {
-			interesting = true
-			break
-		}
-	}
-
-	if interesting {
-		// for _, dom := range cert.AllDomains {
-		// 	err := s.DB.Insert(&CertObserved{
-		// 		Domain:       dom,
-		// 		SerialNumber: cert.SerialNumber,
-		// 		Seen:         time.Now(),
-		// 	})
-		// 	if err != nil {
-		// 		// we will often run two of us, to ensure we don't miss anything, so we expect a lot of duplicate errors
-		// 		if isErrDuplicateKey(err) {
-		// 			continue
-		// 		}
-		// 		return err
-		// 	}
-		// }
-	}
-
-	return nil
 }
 
 func isErrRelationAlreadyExists(err error) bool {
@@ -259,7 +149,21 @@ func main() {
 					url       text      PRIMARY KEY,
 					processed bigint    NOT NULL DEFAULT 0,
 					state     integer   NOT NULL DEFAULT 0
-				);`,
+				);
+					
+				CREATE TABLE IF NOT EXISTS cert_store (
+					key          bytea         PRIMARY KEY,
+					leaf         bytea         NOT NULL
+				);
+
+				CREATE TABLE IF NOT EXISTS cert_index (
+					key          bytea         NOT NULL,
+					domain       text          NOT NULL,
+					discovered   timestamptz   NOT NULL DEFAULT now(),
+
+					CONSTRAINT cert_index_pkey PRIMARY KEY (key, domain)
+				);
+				`,
 			OtherStatements:    que.PrepareStatements,
 			PreparedStatements: map[string]string{},
 		}).AfterConnect,

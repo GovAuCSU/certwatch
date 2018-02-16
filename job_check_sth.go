@@ -1,13 +1,15 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"log"
 	"net/http"
 
 	que "github.com/bgentry/que-go"
+	ctclient "github.com/google/certificate-transparency-go/client"
+	ctjsonclient "github.com/google/certificate-transparency-go/jsonclient"
 	"github.com/jackc/pgx"
 )
 
@@ -28,7 +30,7 @@ func CheckLogSTH(qc *que.Client, logger *log.Logger, job *que.Job, tx *pgx.Tx) e
 
 	// Get a lock, though we should already have one via other means
 	var state int
-	var processed int64
+	var processed uint64
 
 	// ensure state is active, else return error
 	err = tx.QueryRow("SELECT state, processed FROM monitored_logs WHERE url = $1 FOR UPDATE", md.URL).Scan(&state, &processed)
@@ -41,24 +43,12 @@ func CheckLogSTH(qc *que.Client, logger *log.Logger, job *que.Job, tx *pgx.Tx) e
 		return ErrDoNotReschedule
 	}
 
-	// TODO - bit icky - a poisoned CT logs list could maybe lead to us make requests
-	// where we'd prefer not to. But since it's unauthenticated, hosted by Google,
-	// and the results aren't show, I think it's safe enough
-	resp, err := http.Get(fmt.Sprintf("https://%sct/v1/get-sth", md.URL))
+	lc, err := ctclient.New(fmt.Sprintf("https://%s", md.URL), http.DefaultClient, ctjsonclient.Options{Logger: logger})
 	if err != nil {
 		return err
 	}
-	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		return errors.New("bad status code")
-	}
-
-	var sth struct {
-		TreeSize int64 `json:"tree_size"`
-	}
-
-	err = json.NewDecoder(resp.Body).Decode(&sth)
+	sth, err := lc.GetSTH(context.Background())
 	if err != nil {
 		return err
 	}
